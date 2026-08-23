@@ -2,7 +2,7 @@
 
 # Pasarguard Panel Management Tool
 
-# Check for root privileges (Required for writing to / and reading some system dirs)
+# Check for root privileges
 if [ "$EUID" -ne 0 ]; then
     echo "Error: This tool requires root privileges. Please run with: sudo pasarguard"
     exit 1
@@ -35,9 +35,10 @@ backup_panel() {
         return
     fi
 
-    # Generate timestamp and backup file path in root (/)
+    # Generate timestamp and backup file path in /root/
     TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-    BACKUP_FILE="/pasarguard_backup_${TIMESTAMP}.zip"
+    BACKUP_DIR="/root"
+    BACKUP_FILE="${BACKUP_DIR}/pasarguard_backup_${TIMESTAMP}.zip"
 
     echo "Target directories:"
     [ -d "$DIR1" ] && echo " - $DIR1"
@@ -46,19 +47,18 @@ backup_panel() {
     echo ""
     echo "Creating ZIP archive, please wait..."
     
-    # Create the zip file
-    # -r: recursive, -q: quiet (less output), -x: exclude unnecessary cache/temp files if needed
-    zip -r -q "$BACKUP_FILE" "$DIR1" "$DIR2" 2>/dev/null
+    # Create the zip file (Removed 2>/dev/null to show potential errors)
+    zip -r -q "$BACKUP_FILE" "$DIR1" "$DIR2"
 
     if [ $? -eq 0 ]; then
         echo "------------------------------------------------"
         echo "Success! Backup created successfully."
         echo "File location: $BACKUP_FILE"
-        echo "File size: $(du -h "$BACKUP_FILE" | cut -f1)"
+        echo "File details:"
+        ls -lh "$BACKUP_FILE"
     else
         echo "------------------------------------------------"
-        echo "Warning: Backup completed with some errors/warnings."
-        echo "Some files might have been skipped due to permissions."
+        echo "Error: Backup failed. Check the errors above."
     fi
     
     echo "------------------------------------------------"
