@@ -18,7 +18,7 @@ apt-get update -y > /dev/null 2>&1
 apt-get install -y zip unzip > /dev/null 2>&1
 
 # Define the raw URL of the main script (Replace with your actual GitHub username and repo name)
-REPO_RAW_URL="https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO_NAME/main/pasarguard-tool.sh"
+REPO_RAW_URL="https://raw.githubusercontent.com/asd1asd00000/backup-tool/main/pasarguard-tool.sh"
 
 # Download the main script
 echo "Downloading Pasarguard tool..."
