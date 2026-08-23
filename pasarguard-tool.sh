@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Pasarguard Panel Management Tool (Advanced)
+# Pasarguard Panel Management Tool (Ultimate Edition)
 CONFIG_FILE="/root/.pasarguard_config"
 SCRIPT_PATH="/usr/local/bin/pasarguard"
 
@@ -45,6 +45,72 @@ send_telegram_file() {
         -F caption="$caption" > /dev/null
 }
 
+# ==========================================
+# DATABASE DUMP LOGIC (Based on ErfJabs logic)
+# ==========================================
+dump_database() {
+    local OUT_FILE="$1"
+    local ENV_FILE="/opt/pasarguard/.env"
+    
+    if [[ ! -f "$ENV_FILE" ]]; then
+        echo "Warning: .env file not found. Skipping database dump."
+        return 1
+    fi
+
+    local DATABASE_URL=$(grep -v '^#' "$ENV_FILE" | grep 'SQLALCHEMY_DATABASE_URL' | awk -F '=' '{print $2}' | tr -d ' ' | tr -d '"' | tr -d "'")
+    
+    if [[ -z "$DATABASE_URL" ]]; then
+        echo "Warning: SQLALCHEMY_DATABASE_URL not found in .env."
+        return 1
+    fi
+
+    local db_user="" db_password="" db_name="" db_port="5432"
+
+    # Parse URL (supports postgresql://user:pass@host:port/dbname or without port)
+    if [[ "$DATABASE_URL" =~ ^(postgresql|postgres|timescaledb)(\+[a-z0-9]+)?://([^:]+):([^@]+)@([^:/]+):?([0-9]*)/?(.+)$ ]]; then
+        db_user="${BASH_REMATCH[3]}"
+        db_password="${BASH_REMATCH[4]}"
+        db_name="${BASH_REMATCH[7]}"
+    elif [[ "$DATABASE_URL" =~ ^(postgresql|postgres|timescaledb)(\+[a-z0-9]+)?://([^:]+):([^@]+)@([^/]+)/(.+)$ ]]; then
+        db_user="${BASH_REMATCH[3]}"
+        db_password="${BASH_REMATCH[4]}"
+        db_name="${BASH_REMATCH[6]}"
+    else
+        echo "Warning: Could not parse DATABASE_URL."
+        return 1
+    fi
+
+    # Find TimescaleDB Container
+    local pg_container=$(docker ps --filter "ancestor=timescaledb/timescaledb" --format "{{.Names}}" | head -n 1)
+    if [[ -z "$pg_container" ]]; then
+        pg_container=$(docker ps --filter "publish=5432" --format "{{.Names}}" | head -n 1)
+    fi
+    if [[ -z "$pg_container" ]]; then
+        pg_container=$(docker ps | grep -i timescaledb | awk '{print $NF}' | head -n 1)
+    fi
+
+    if [[ -z "$pg_container" ]]; then
+        echo "Warning: TimescaleDB container not found."
+        return 1
+    fi
+
+    echo "Dumping database '$db_name' from container '$pg_container'..."
+    docker exec -e PGPASSWORD="$db_password" "$pg_container" pg_dump -U "$db_user" -d "$db_name" --clean --if-exists > "$OUT_FILE" 2>/dev/null
+
+    if [ -s "$OUT_FILE" ]; then
+        echo "Database dump successful."
+        return 0
+    else
+        echo "Warning: Database dump failed or is empty."
+        rm -f "$OUT_FILE"
+        return 1
+    fi
+}
+
+# ==========================================
+# BACKUP FUNCTIONS
+# ==========================================
+
 do_local_backup() {
     echo "------------------------------------------------"
     echo "Starting Local Backup..."
@@ -62,9 +128,19 @@ do_local_backup() {
 
     local TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
     local BACKUP_FILE="/root/pasarguard_backup_${TIMESTAMP}.zip"
+    local DB_DUMP="/tmp/pasarguard_db_${TIMESTAMP}.sql"
+
+    echo "Extracting Database..."
+    dump_database "$DB_DUMP"
 
     echo "Creating ZIP archive with password, please wait..."
     zip -P "$ZIP_PASS" -r -q "$BACKUP_FILE" "/opt/pasarguard" "/var/lib/pasarguard" 2>/dev/null
+
+    if [ -s "$DB_DUMP" ]; then
+        echo "Adding database dump to archive..."
+        zip -P "$ZIP_PASS" -j -q "$BACKUP_FILE" "$DB_DUMP"
+        rm -f "$DB_DUMP"
+    fi
 
     if [ $? -eq 0 ]; then
         echo "------------------------------------------------"
@@ -89,19 +165,25 @@ do_telegram_backup() {
         return 1
     fi
 
-    if [ "$is_auto" -eq 0 ]; then
-        echo "------------------------------------------------"
-        echo "Starting Telegram Backup..."
-    fi
+    [ "$is_auto" -eq 0 ] && echo -e "------------------------------------------------\nStarting Telegram Backup..."
 
     local TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
     local TEMP_FILE="/tmp/pasarguard_backup_${TIMESTAMP}.zip"
     local FINAL_FILE="/root/pasarguard_backup_${TIMESTAMP}.zip"
+    local DB_DUMP="/tmp/pasarguard_db_${TIMESTAMP}.sql"
 
-    # Create zip with configured password
+    echo "Extracting Database..."
+    dump_database "$DB_DUMP"
+
     zip -P "$BACKUP_PASS" -r -q "$TEMP_FILE" "/opt/pasarguard" "/var/lib/pasarguard" 2>/dev/null
 
-    if [ $? -ne 0 ]; then
+    if [ -s "$DB_DUMP" ]; then
+        echo "Adding database dump to archive..."
+        zip -P "$BACKUP_PASS" -j -q "$TEMP_FILE" "$DB_DUMP"
+        rm -f "$DB_DUMP"
+    fi
+
+    if [ ! -s "$TEMP_FILE" ]; then
         send_telegram_message "❌ <b>Pasarguard Backup Failed!</b>\nServer: $(hostname)"
         [ "$is_auto" -eq 0 ] && read -p "Press Enter..."
         return 1
@@ -114,17 +196,14 @@ do_telegram_backup() {
     if [ "$FILE_SIZE_MB" -le 45 ]; then
         send_telegram_file "$TEMP_FILE" "Pasarguard Backup - $(date)"
         send_telegram_message "$MSG_SUCCESS\n📁 File sent to this chat."
-        # Move to root for history, or just delete. Let's keep a small log or delete to save space.
         rm -f "$TEMP_FILE"
     else
-        # File too large for Telegram API
         mv "$TEMP_FILE" "$FINAL_FILE"
-        send_telegram_message "$MSG_SUCCESS\n⚠️ <b>Warning:</b> File is larger than 45MB and couldn't be sent via Telegram.\n📁 Saved locally at: $FINAL_FILE"
+        send_telegram_message "$MSG_SUCCESS\n⚠️ <b>Warning:</b> File is larger than 45MB.\n📁 Saved locally at: $FINAL_FILE"
     fi
 
     if [ "$is_auto" -eq 0 ]; then
-        echo "------------------------------------------------"
-        echo "Success! Backup sent to Telegram (or saved locally if >45MB)."
+        echo -e "------------------------------------------------\nSuccess! Backup processed."
         echo "------------------------------------------------"
         read -p "Press Enter to return to the menu..."
     fi
@@ -182,7 +261,6 @@ show_telegram_menu() {
 # MAIN LOGIC
 # ==========================================
 
-# Handle Auto-Backup via Cron (Hidden argument)
 if [ "$1" == "--auto-backup" ]; then
     do_telegram_backup 1
     exit 0
@@ -216,14 +294,12 @@ while true; do
                     4)
                         read -p "Enter interval in hours (e.g., 1, 6, 12, 24): " BACKUP_INTERVAL
                         if [[ "$BACKUP_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BACKUP_INTERVAL" -gt 0 ]; then
-                            # Remove old cron jobs for this script
                             crontab -l 2>/dev/null | grep -v "pasarguard --auto-backup" | crontab -
-                            # Add new cron job
                             (crontab -l 2>/dev/null; echo "0 */$BACKUP_INTERVAL * * * $SCRIPT_PATH --auto-backup >> /var/log/pasarguard-backup.log 2>&1") | crontab -
                             save_config
                             echo "Cron job set successfully! Backup will run every $BACKUP_INTERVAL hours."
                         else
-                            echo "Invalid number. Please enter a valid hour (e.g., 12)."
+                            echo "Invalid number."
                         fi
                         read -p "Press Enter to continue..."
                         ;;
